@@ -1,0 +1,13 @@
+_tools/
+_bridge/
+*.png
+*.mkv
+*.mp4
+mod/RVCheckpointPlus/saves/*.lua
+showcase/raw/
+dist/
+showcase/*.mp4
+showcase/*.png
+showcase/nexus/raw/
+showcase/nexus/*.jpg
+showcase/nexus/cand/

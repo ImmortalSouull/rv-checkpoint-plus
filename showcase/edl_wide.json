@@ -1,0 +1,132 @@
+{
+ "fps": 30,
+ "theme": {
+  "accent": "#F2C230",
+  "text": "#FFFFFF",
+  "chip": "#0A0D12D0"
+ },
+ "transition": {
+  "type": "fade",
+  "duration": 0.3
+ },
+ "clip_volume": 0.9,
+ "fade_out": 0.8,
+ "normalize_audio": true,
+ "size": [
+  1920,
+  1080
+ ],
+ "segments": [
+  {
+   "clip": "raw/take6.mp4",
+   "crop": [
+    440,
+    0,
+    2560,
+    1440
+   ],
+   "fill": "crop",
+   "volume": 0.9,
+   "in": 0.6,
+   "dur": 2.4,
+   "hook": "Save anywhere."
+  },
+  {
+   "clip": "raw/take6.mp4",
+   "crop": [
+    440,
+    0,
+    2560,
+    1440
+   ],
+   "fill": "crop",
+   "volume": 0.9,
+   "in": 3.0,
+   "dur": 5.8,
+   "title": "F5  -  quick save, even while driving",
+   "transition": {
+    "type": "cut"
+   }
+  },
+  {
+   "clip": "raw/take6.mp4",
+   "crop": [
+    440,
+    0,
+    2560,
+    1440
+   ],
+   "fill": "crop",
+   "volume": 0.9,
+   "in": 13.6,
+   "dur": 3.4,
+   "title": "Stuck in the trees?"
+  },
+  {
+   "clip": "raw/take6.mp4",
+   "crop": [
+    440,
+    0,
+    2560,
+    1440
+   ],
+   "fill": "crop",
+   "volume": 0.9,
+   "in": 21.6,
+   "dur": 4.2,
+   "title": "F7  -  RV lifted free",
+   "transition": {
+    "type": "cut"
+   }
+  },
+  {
+   "clip": "raw/take6.mp4",
+   "crop": [
+    440,
+    0,
+    2560,
+    1440
+   ],
+   "fill": "crop",
+   "volume": 0.9,
+   "in": 27.6,
+   "dur": 2.6,
+   "title": "RV destroyed (staged for the demo)"
+  },
+  {
+   "clip": "raw/take6.mp4",
+   "crop": [
+    440,
+    0,
+    2560,
+    1440
+   ],
+   "fill": "crop",
+   "volume": 0.9,
+   "in": 37.2,
+   "dur": 7.4,
+   "title": "Back at your quick save, not the checkpoint"
+  },
+  {
+   "clip": "raw/take6.mp4",
+   "crop": [
+    440,
+    0,
+    2560,
+    1440
+   ],
+   "fill": "crop",
+   "volume": 0.9,
+   "in": 55.0,
+   "dur": 7.4,
+   "title": "F8  -  go back to any earlier checkpoint"
+  },
+  {
+   "card": {
+    "title": "RV Checkpoint+",
+    "sub": "free mod for RV There Yet?"
+   },
+   "dur": 3.4
+  }
+ ]
+}
