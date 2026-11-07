@@ -1,6 +1,6 @@
 # RV Checkpoint+ (RV There Yet?)
 
-**English** | [Русский](README.ru.md)
+**English** | [Русский](README.ru.md) | [Polski](README.pl.md)
 
 ![RV Checkpoint+](showcase/nexus/final/01_cover.jpg)
 
