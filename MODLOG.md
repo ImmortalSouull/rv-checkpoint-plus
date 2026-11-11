@@ -64,3 +64,37 @@ Not tested: real second player (clients), other maps (Snow/Jungle/Beach).
 - Fixes found while filming: quick save while mid-corner restored the RV rolled 40 deg -> now saves the last steady spot;
   restore with host seated in the RV far from checkpoint -> RV frozen above target while world streams.
 - Footage still shows the old long F7 message; mod text was shortened afterwards.
+
+### 2026-11-11 v1.1.0 — fixes from Nexus comments (game v1.4.1.22052, UE4SS v3.0.1-1218)
+Comments: (1) co-op: after a mod reload friends saw the RV armor under the ground, touching the RV flipped/blew it up,
+"save bricked"; RV spawned ~3 m up and dropped. (2) "doesn't work at all" after a game update (Vortex install).
+(3) death loop: players restored mid-air -> fall -> game over -> restore again. (4) wish: 3 rotating saves.
+- Game updated v1.3.20702 -> v1.4.1.22052. All classes/functions the mod uses still exist. UE4SS 1218 works.
+  Vortex installs only the mod folder, not UE4SS -> new `-with-UE4SS.zip` (extract into the game folder).
+- ROOT CAUSE (1), reproduced with 2 instances: `SetSimulatePhysics(false)` on the RV root is mirrored to clients
+  (replicated movement bRepPhysics); after the toggle + teleport the client copy lost 42 of 119 attached parts and lay
+  on its side while the host's was fine. "Bricked" = every reload ran the same restore again.
+- FIX: move the RV with `AVS_Vehicle_C:TeleportVehicle(loc, rot, false)` on the host + `BP_VehicleBase_C:ForceTeleport(loc)`
+  (reliable multicast `DoForceTeleport` -> every machine calls TeleportVehicle(loc, its current rotation)). Client
+  copies match the host exactly (pos, yaw, parts). Never toggle physics.
+- Ground: `KismetSystemLibrary:LineTraceSingle` ignoring the RV + `GetAttachedActors` (118) + pawns. RV origin is ~74-81
+  above ground; saved as `rv.clear`. A miss = not streamed yet.
+- Damage: hooks on BP functions fire AFTER the body (Internal_TakePlayerDamage "pre" already sees the damage) -> can't
+  cancel. `BP_FirstPersonCharacter_C.Invulnerable` (not replicated) is checked on the server: set on the host it saves
+  clients from a 40 m fall (control without it: 100 damage = dead).
+- Restore now: protect all players -> host goes to the target first (World Partition streams around the host) ->
+  RV placed on the traced ground with the saved clearance (or hovers above via repeated moveRV while the host rides it)
+  -> players placed from RV-relative offsets on traced ground -> after 3 s anyone who fell through is moved again ->
+  protection off 6 s later. Game over within 60 s of a restore (same process, no menu in between) -> skip the auto
+  restore once; F9 forces it.
+- v1.4.1: after RestartFromCheckpoint the game no longer re-seats players (driver and passenger tested).
+- Backups: steam id from `%LOCALAPPDATA%\ride\Saved\Logs\Ride.log` ("SteamID: N") -> `SaveGames\<id>\<name>.sav/.meta.sav`;
+  ring of 3 in `saves/<key>.b<n>.*` at quick save (+2.5 s) and checkpoint (+3 s). RestartFromCheckpoint re-reads the
+  .sav from disk (verified: shield 11 -> restore older backup -> 70).
+- Co-op test rig (dev only): copy `C:\Users\PC\RV_B` (exe + ue4ss, Content/Engine/Plugins junctions, steam_appid.txt),
+  launched windowed WITH Steam (needed for the network version checksum). Host must load through the menu with
+  Session Type = IP (console `open ...?listen` hosts but rejects joins with "Server full": no session).
+  Client: remove the 3 extra local players (`GameplayStatics:RemovePlayer`), `GameInstance:SetupNetDriverForHostType(1)`,
+  `open 127.0.0.1:7777`. Seat a player: `<seat>:Interact(pawn, {}, 0.0, false, {})`.
+- Same Steam account on both copies -> same player name; restore matches saved players by name with a queue.
+- PostMessage keys don't reach UE4SS keybinds; test through the dev bridge (`_tools/rvc.ps1`, RVCP table).

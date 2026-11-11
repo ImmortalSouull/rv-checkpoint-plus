@@ -2,7 +2,7 @@
 -- Quick save anywhere, quick load, pick an earlier checkpoint, unstuck player, recover RV,
 -- and auto-save after repairs. Host-side: everything runs on the machine that hosts the game.
 
-local VERSION = "1.0.0"
+local VERSION = "1.1.0"
 
 local function script_dir()
     local src = debug.getinfo(1, "S").source:gsub("^@", "")
@@ -142,6 +142,102 @@ end
 local function deleteSidecar(si) os.remove(sidecarPath(si)) end
 
 ---------------------------------------------------------------------------
+-- rotating backups of the game's own session save (<name>.sav + <name>.meta.sav)
+---------------------------------------------------------------------------
+local function readFile(p)
+    local f = io.open(p, "rb"); if not f then return nil end
+    local s = f:read("*a"); f:close(); return s
+end
+local function exists(p)
+    local f = io.open(p, "rb"); if not f then return false end
+    f:close(); return true
+end
+local function writeFile(p, s)
+    local f = io.open(p, "wb"); if not f then return false end
+    f:write(s); f:close(); return true
+end
+
+-- %LOCALAPPDATA%\ride\Saved\SaveGames\<steam id>\  (the id comes from the game's own log)
+local saveGameDir = nil
+local function findGameSave(name)
+    local la = os.getenv("LOCALAPPDATA")
+    if not la then return nil end
+    local base = la .. "/ride/Saved/SaveGames/"
+    if saveGameDir and exists(saveGameDir .. name .. ".sav") then return saveGameDir end
+    local ids = {}
+    local logText = readFile(la .. "/ride/Saved/Logs/Ride.log") or ""
+    for id in logText:gmatch("SteamID: (%d+)") do ids[#ids + 1] = id end
+    for id in logText:gmatch("for user (%w+)") do ids[#ids + 1] = id end
+    ids[#ids + 1] = ""
+    for _, id in ipairs(ids) do
+        local dir = base .. (id ~= "" and (id .. "/") or "")
+        if exists(dir .. name .. ".sav") then saveGameDir = dir; return dir end
+    end
+    return nil
+end
+
+local function backupIndexPath(si) return SAVE_DIR .. fileKey(si.level .. "|" .. si.name) .. ".backups.lua" end
+local function backupFile(si, n, ext) return SAVE_DIR .. fileKey(si.level .. "|" .. si.name) .. ".b" .. n .. ext end
+
+local function readBackupIndex(si)
+    local s = readFile(backupIndexPath(si))
+    if s then
+        local fn = load(s, "backups", "t", {})
+        local ok, data = pcall(fn or function() end)
+        if ok and type(data) == "table" and type(data.list) == "table" then return data end
+    end
+    return { last = 0, list = {} }
+end
+
+-- Copy the game's save files (+ our quick save, if any) into the next of N rotating slots.
+local function makeBackup(si, why)
+    local keep = cfg("keep_backups", 3)
+    if not keep or keep <= 0 then return end
+    local dir = findGameSave(si.name)
+    if not dir then log("backup skipped: can't find the game's save file for '" .. si.name .. "'"); return end
+    local sav, meta = readFile(dir .. si.name .. ".sav"), readFile(dir .. si.name .. ".meta.sav")
+    if not sav then return end
+    local idx = readBackupIndex(si)
+    local n = (idx.last % keep) + 1
+    writeFile(backupFile(si, n, ".sav"), sav)
+    if meta then writeFile(backupFile(si, n, ".meta.sav"), meta) end
+    local side = readFile(sidecarPath(si))
+    if side then writeFile(backupFile(si, n, ".lua"), side) else os.remove(backupFile(si, n, ".lua")) end
+    local list = {}
+    for _, e in ipairs(idx.list) do if e.n ~= n and e.n <= keep then list[#list + 1] = e end end
+    list[#list + 1] = { n = n, time = os.time(), cp = si.cp, why = why, quick = side ~= nil }
+    writeFile(backupIndexPath(si), "return " .. ser({ last = n, list = list }) .. "\n")
+    log(string.format("backup %d saved (%s, cp %d)", n, why, si.cp))
+end
+
+-- newest first
+local function backupList(si)
+    local idx = readBackupIndex(si)
+    local list = {}
+    for _, e in ipairs(idx.list) do
+        if exists(backupFile(si, e.n, ".sav")) then list[#list + 1] = e end
+    end
+    table.sort(list, function(a, b) return a.time > b.time end)
+    return list
+end
+
+-- Put a backup back in place of the game's save. Returns the checkpoint index it belongs to.
+local function applyBackup(si, e)
+    local dir = findGameSave(si.name)
+    if not dir then return nil end
+    local sav, meta = readFile(backupFile(si, e.n, ".sav")), readFile(backupFile(si, e.n, ".meta.sav"))
+    if not sav then return nil end
+    -- keep what is there now as well, in case the backup turns out worse
+    local cur = readFile(dir .. si.name .. ".sav")
+    if cur then writeFile(SAVE_DIR .. fileKey(si.level .. "|" .. si.name) .. ".before-restore.sav", cur) end
+    writeFile(dir .. si.name .. ".sav", sav)
+    if meta then writeFile(dir .. si.name .. ".meta.sav", meta) end
+    local side = readFile(backupFile(si, e.n, ".lua"))
+    if side then writeFile(sidecarPath(si), side) else deleteSidecar(si) end
+    return e.cp
+end
+
+---------------------------------------------------------------------------
 -- RV state helpers
 ---------------------------------------------------------------------------
 -- "upright" = not on its side / roof. Driving over rough ground easily reaches 30-40 degrees, so be generous.
@@ -167,12 +263,54 @@ local function stopRV(rv)
     pcall(function() root:SetPhysicsAngularVelocityInDegrees(v3(0, 0, 0), false, FName("None")) end)
 end
 
-local function placeRV(rv, loc, yaw, pitch, roll)
-    rv:K2_SetActorLocationAndRotation(loc, { Pitch = pitch or 0, Yaw = yaw, Roll = roll or 0 }, false, {}, true)
+-- Move the RV. The host's copy gets the exact spot and heading through the vehicle's own teleport
+-- (chassis + wheels together), then the game's ForceTeleport multicast makes every machine move its own
+-- copy the same way the game does it. Physics is never switched off: clients mirror that switch, and
+-- their RV then came back with its armor panels left under the ground.
+local function moveRV(rv, loc, yaw, pitch, roll)
+    local rot = { Pitch = pitch or 0, Yaw = yaw, Roll = roll or 0 }
+    if not pcall(function() rv:TeleportVehicle(loc, rot, false) end) then
+        rv:K2_SetActorLocationAndRotation(loc, rot, false, {}, true)
+    end
+    pcall(function() rv:ForceTeleport(loc) end)
     stopRV(rv)
     pcall(function() rv:FixTiresAfterTeleport() end)
+end
+
+local function placeRV(rv, loc, yaw, pitch, roll)
+    moveRV(rv, loc, yaw, pitch, roll)
     -- physics can keep a tiny bit of momentum from the frame we moved in
     ExecuteWithDelay(150, function() ExecuteInGameThread(function() if valid(rv) then stopRV(rv) end end) end)
+end
+
+-- the RV and everything bolted onto it (panels, seats, shelves...)
+local function rvParts(rv)
+    local out = { rv }
+    pcall(function()
+        local arr = {}
+        rv:GetAttachedActors(arr, true, true)
+        for i = 1, #arr do out[#out + 1] = arr[i]:get() end
+    end)
+    return out
+end
+
+local KSL
+local NOCOLOR = { R = 0, G = 0, B = 0, A = 0 }
+-- Height of whatever is under (x, y) between fromZ and toZ, or nil when nothing is there
+-- (also nil while that part of the world hasn't streamed in yet).
+local function groundZ(ctx, x, y, fromZ, toZ, ignore)
+    KSL = KSL or StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+    local hit = {}
+    local ok, did = pcall(function()
+        return KSL:LineTraceSingle(ctx, v3(x, y, fromZ), v3(x, y, toZ), 0, false, ignore or {}, 0, hit, true, NOCOLOR, NOCOLOR, 0)
+    end)
+    if ok and did and hit.ImpactPoint then return hit.ImpactPoint.Z end
+    return nil
+end
+
+-- the game's own respawn protection flag; the server checks it for every player's damage
+local function setInvulnerable(pawn, on)
+    pcall(function() pawn.Invulnerable = on end)
 end
 
 -- Put a player somewhere near a point, using the game's own client-safe teleport.
@@ -194,7 +332,21 @@ local function spotNextToRV(rv, i)
     local r = v3(-math.sin(y), math.cos(y), 0)
     local offs = { { 0, -380 }, { -650, 0 }, { 0, 380 }, { 650, 0 }, { -350, -380 }, { -350, 380 }, { 350, -380 }, { 350, 380 } }
     local o = offs[((i - 1) % #offs) + 1]
-    return v3(l.X + f.X * o[1] + r.X * o[2], l.Y + f.Y * o[1] + r.Y * o[2], l.Z + 120)
+    local x, yy = l.X + f.X * o[1] + r.X * o[2], l.Y + f.Y * o[1] + r.Y * o[2]
+    -- stand on the ground there, not 1 m above a slope (or 5 m above a ditch)
+    local g = groundZ(rv, x, yy, l.Z + 400, l.Z - 1500, rvParts(rv))
+    return v3(x, yy, (g and (g + 100)) or (l.Z + 120))
+end
+
+-- RV-local offset <-> world, heading only
+local function toLocal(rvLoc, rvYaw, p)
+    local y = math.rad(rvYaw)
+    local dx, dy = p.X - rvLoc.X, p.Y - rvLoc.Y
+    return { x = dx * math.cos(y) + dy * math.sin(y), y = -dx * math.sin(y) + dy * math.cos(y), z = p.Z - rvLoc.Z }
+end
+local function toWorld(rvLoc, rvYaw, o)
+    local y = math.rad(rvYaw)
+    return v3(rvLoc.X + o.x * math.cos(y) - o.y * math.sin(y), rvLoc.Y + o.x * math.sin(y) + o.y * math.cos(y), rvLoc.Z + o.z)
 end
 
 -- seated somewhere (driver seat, sofa, passenger seat...): the character is attached to an actor
@@ -221,10 +373,38 @@ local S = {
     repairDirtyAt = nil,
     lastAutosave = 0,
     menu = nil,            -- { sel=, until= }
+    bmenu = nil,           -- backup menu { list=, sel=, until= }
     lastRecover = -100,
     hooked = false,
     busyUntil = 0,
+    forceRestore = false,  -- set by F9: load the quick save even if the last load ended badly
+    protectUntil = 0,      -- players can't be hurt until then (restore in progress)
+    protected = {},        -- pawn address -> pawn we made invulnerable
 }
+
+-- Keep every player invulnerable while a restore moves people around (and a few seconds after),
+-- so a bad spot can't kill anyone and turn the reload into a game-over loop.
+local function protectPlayers(seconds)
+    S.protectUntil = math.max(S.protectUntil, NOW + seconds)
+end
+local function updateProtection()
+    if NOW < S.protectUntil then
+        for _, pc in ipairs(all("BP_FirstPersonPlayerController_C")) do
+            local p = pc.Pawn
+            if valid(p) then
+                local a = p:GetAddress()
+                if not S.protected[a] then
+                    local was = false
+                    pcall(function() was = p.Invulnerable end)
+                    if not was then S.protected[a] = p; setInvulnerable(p, true) end
+                end
+            end
+        end
+    elseif next(S.protected) then
+        for _, p in pairs(S.protected) do if valid(p) then setInvulnerable(p, false) end end
+        S.protected = {}
+    end
+end
 
 local function busy()
     if NOW < S.busyUntil then return true end
@@ -283,20 +463,35 @@ local function quickSave(reason)
 
     saveSession(gm)
 
+    -- how high the RV's origin sits above the ground, so a restore can put it straight onto its wheels
+    local parts = rvParts(rv)
+    local g = groundZ(rv, pose.x, pose.y, pose.z + 300, pose.z - 2000, parts)
+    pose.clear = g and math.max(40, math.min(250, pose.z - g)) or nil
+
     local data = {
-        v = 1, mod = VERSION, session = si.name, level = si.level, cp = si.cp, time = os.time(),
+        v = 2, mod = VERSION, session = si.name, level = si.level, cp = si.cp, time = os.time(),
         rv = pose,
         players = {},
     }
+    -- players are stored relative to the RV: they come back around it, wherever it lands
+    local rvLoc = v3(pose.x, pose.y, pose.z)
     for _, pc in ipairs(all("BP_FirstPersonPlayerController_C")) do
         local pawn = pc.Pawn
         if valid(pawn) then
             local pl = pawn:K2_GetActorLocation()
-            data.players[#data.players + 1] = { name = playerName(pc), x = pl.X, y = pl.Y, z = pl.Z,
-                yaw = pawn:K2_GetActorRotation().Yaw, inRV = isInRV(pawn, rv) }
+            local falling = false
+            pcall(function() falling = pawn.CharacterMovement:IsFalling() end)
+            local e = { name = playerName(pc), yaw = pawn:K2_GetActorRotation().Yaw - pose.yaw, inRV = isInRV(pawn, rv) }
+            -- only remember a spot that was safe to stand on and near the RV
+            if not falling and dist(pl, rvLoc) < 3000 then e.rel = toLocal(rvLoc, pose.yaw, pl) end
+            data.players[#data.players + 1] = e
         end
     end
     if writeSidecar(si, data) then
+        ExecuteWithDelay(2500, function() ExecuteInGameThread(function()
+            local s2 = sessionInfo()
+            if s2 and s2.name == si.name then pcall(makeBackup, s2, "quick save") end
+        end) end)
         S.lastAutosave = NOW
         if reason == "auto" then toast("Auto saved")
         elseif fromSteady then toast("Quick saved  (at the last steady spot)")
@@ -315,6 +510,7 @@ local function quickLoad()
     end
     toast("Loading quick save...", 5)
     S.busyUntil = NOW + 5
+    S.forceRestore = true
     gm:RestartFromCheckpoint(data.cp)
 end
 
@@ -355,8 +551,47 @@ local function checkpointMenu()
     else
         S.menu = { sel = si.cp }
     end
+    S.bmenu = nil
     S.menu["until"] = NOW + 8
     showMenu()
+end
+
+-- Shift+F9: step through the rotating backups (newest first), F9 restores the selected one.
+local function backupLabel(e, count, i)
+    local what = e.quick and "quick save" or (e.why or "save")
+    return string.format("backup %d of %d: %s, %s (%s)", i, count, os.date("%H:%M", e.time), what, cpLabel(e.cp, checkpointCount()))
+end
+
+local function backupMenu()
+    if not hostOnly() or busy() then return end
+    local si = sessionInfo()
+    if not si then return end
+    if cfg("keep_backups", 3) <= 0 then toast("Backups are turned off in config.lua"); return end
+    if S.bmenu and NOW < S.bmenu["until"] then
+        S.bmenu.sel = S.bmenu.sel % #S.bmenu.list + 1
+    else
+        local list = backupList(si)
+        if #list == 0 then toast("No backups yet: one is made at every quick save and checkpoint"); return end
+        S.bmenu = { list = list, sel = 1 }
+    end
+    S.menu = nil
+    S.bmenu["until"] = NOW + 8
+    local e = S.bmenu.list[S.bmenu.sel]
+    toast(string.format("Restore %s\n[Shift+%s] older     [%s] restore     wait = cancel",
+        backupLabel(e, #S.bmenu.list, S.bmenu.sel), CFG.keys.quick_load or "F9", CFG.keys.quick_load or "F9"), 8)
+end
+
+local function restoreBackup()
+    local m = S.bmenu; S.bmenu = nil
+    local gm, si = getGM(), sessionInfo()
+    if not (m and gm and si) then return end
+    local e = m.list[m.sel]
+    local cp = applyBackup(si, e)
+    if not cp then toast("Couldn't restore that backup (save file not found)"); return end
+    toast("Restoring backup from " .. os.date("%H:%M", e.time) .. "...", 5)
+    S.busyUntil = NOW + 5
+    S.forceRestore = true
+    gm:RestartFromCheckpoint(cp)
 end
 
 local function unstuckPlayers(everyone)
@@ -364,6 +599,7 @@ local function unstuckPlayers(everyone)
     if not rv then return end
     if everyone then
         if not hostOnly() then return end
+        protectPlayers(4)
         local n = 0
         for i, pc in ipairs(all("BP_FirstPersonPlayerController_C")) do
             if valid(pc.Pawn) and not isInRV(pc.Pawn, rv) then
@@ -380,6 +616,7 @@ local function unstuckPlayers(everyone)
             toast(ok and "Back at the RV" or "Couldn't move you")
             return
         end
+        protectPlayers(4)
         teleportPlayer(pc, spotNextToRV(rv, 1), rv:K2_GetActorRotation().Yaw)
         toast("Back at the RV")
     end
@@ -420,60 +657,106 @@ end
 ---------------------------------------------------------------------------
 -- restore after a (re)load: put RV + players back where the quick save was made
 ---------------------------------------------------------------------------
+local function clamp20(a) return math.max(-20, math.min(20, a or 0)) end
+
 local function startRestore(data)
-    S.restore = { data = data, stage = "wait", at = NOW + 1.5, deadline = NOW + 40 }
+    S.restore = { data = data, stage = "wait", at = NOW + 1.5, deadline = NOW + 45 }
+    protectPlayers(60)
+end
+
+-- what a ground trace must not hit: the RV, its parts and the players
+local function traceIgnore(rv)
+    local ign = rvParts(rv)
+    for _, pc in ipairs(all("BP_FirstPersonPlayerController_C")) do
+        if valid(pc.Pawn) then ign[#ign + 1] = pc.Pawn end
+    end
+    return ign
+end
+
+-- A player's saved spot around the RV if it was a safe one, otherwise next to the door.
+-- Always on the ground (the RV floor counts, so people who stood inside stay inside).
+local function playerSpot(rv, s, i)
+    if s and s.rel then
+        local p = toWorld(rv:K2_GetActorLocation(), rv:K2_GetActorRotation().Yaw, s.rel)
+        local ign = {}
+        for _, pc in ipairs(all("BP_FirstPersonPlayerController_C")) do
+            if valid(pc.Pawn) then ign[#ign + 1] = pc.Pawn end
+        end
+        local g = groundZ(rv, p.X, p.Y, p.Z + 150, p.Z - 600, ign)
+        if g then return v3(p.X, p.Y, g + 100) end
+    end
+    return spotNextToRV(rv, i)
 end
 
 local function stepRestore()
     local R = S.restore
     if not R or NOW < R.at then return end
-    if NOW > R.deadline then log("restore timed out"); S.restore = nil; return end
+    if NOW > R.deadline then log("restore timed out"); S.restore = nil; S.protectUntil = NOW + 5; return end
     local rv, pc = getRV(), localPC()
     local d = R.data
     local target = v3(d.rv.x, d.rv.y, d.rv.z)
 
     if R.stage == "wait" then
         if not (rv and pc and valid(pc.Pawn)) then R.at = NOW + 0.5; return end
-        -- After a restart the game re-seats players in the RV, so the host may be riding along.
-        -- Park the RV, frozen, just above the saved spot; whoever sits in it comes with it, and the
-        -- World Partition streams the area in around the host before anything touches the ground.
-        local far = dist(rv:K2_GetActorLocation(), target) > 20000
-        pcall(function() rv.RootComponent:SetSimulatePhysics(false) end)
-        rv:K2_SetActorLocationAndRotation(v3(target.X, target.Y, target.Z + 300),
-            { Pitch = 0, Yaw = d.rv.yaw, Roll = 0 }, false, {}, true)
-        if not seated(pc.Pawn) then
+        -- After a restart the game re-seats players who were in the RV, so the host may be riding along.
+        -- The world only streams in around the host: either the host rides the RV over there, or the
+        -- host goes first and the RV follows once there is ground under the saved spot.
+        R.hostSeated = seated(pc.Pawn)
+        if not R.hostSeated then
             local yr = math.rad(d.rv.yaw)
             teleportPlayer(pc, v3(target.X + math.sin(yr) * 420, target.Y - math.cos(yr) * 420, target.Z + 150), d.rv.yaw)
         end
         toast("Restoring your quick save...", 3)
-        R.stage = "rv"; R.at = NOW + (far and 4.0 or 2.0)
-    elseif R.stage == "rv" then
+        R.stage = "ground"; R.giveUp = NOW + 20; R.at = NOW + 0.5
+    elseif R.stage == "ground" then
         if not rv then R.at = NOW + 0.5; return end
-        -- a save made mid-corner can carry a lot of body roll; keep the slope, drop the lean,
-        -- and let the suspension settle it
-        local function clamp(a) return math.max(-20, math.min(20, a)) end
-        local pitch, roll = clamp(d.rv.pitch), clamp(d.rv.roll)
-        rv:K2_SetActorLocationAndRotation(v3(target.X, target.Y, target.Z + 60),
-            { Pitch = pitch, Yaw = d.rv.yaw, Roll = roll }, false, {}, true)
-        pcall(function() rv.RootComponent:SetSimulatePhysics(true) end)
-        placeRV(rv, v3(target.X, target.Y, target.Z + 60), d.rv.yaw, pitch, roll)
-        R.stage = "players"; R.at = NOW + 1.5
+        local g = groundZ(rv, target.X, target.Y, target.Z + 1500, target.Z - 1500, traceIgnore(rv))
+        if g or NOW > R.giveUp then
+            -- straight onto its wheels: the saved height above the ground, plus a few cm.
+            -- A save made mid-corner can carry body roll; keep the slope, drop the lean.
+            local z = g and (g + (d.rv.clear or 90) + 15) or (target.Z + 60)
+            if not g then log("restore: no ground under the saved spot, placing at the saved height") end
+            placeRV(rv, v3(target.X, target.Y, z), d.rv.yaw, clamp20(d.rv.pitch), clamp20(d.rv.roll))
+            R.stage = "players"; R.at = NOW + 1.5
+        else
+            -- not streamed in yet: keep the RV (and whoever rides it) hovering right above the spot
+            if R.hostSeated then moveRV(rv, v3(target.X, target.Y, target.Z + 400), d.rv.yaw, 0, 0) end
+            R.at = NOW + 0.25
+        end
     elseif R.stage == "players" then
+        -- match saved players by name (a queue per name: two players can share one)
         local byName = {}
-        for _, p in ipairs(d.players or {}) do byName[p.name] = p end
+        for _, p in ipairs(d.players or {}) do
+            byName[p.name] = byName[p.name] or {}
+            table.insert(byName[p.name], p)
+        end
+        R.expect = {}
         for i, p in ipairs(all("BP_FirstPersonPlayerController_C")) do
-            local s = byName[playerName(p)]
-            if valid(p.Pawn) and seated(p.Pawn) then
-                -- sitting in the RV: already where they belong
-            elseif s and not s.inRV and dist(v3(s.x, s.y, s.z), target) < 4000 then
-                teleportPlayer(p, v3(s.x, s.y, s.z + 30), s.yaw)
-            else
-                teleportPlayer(p, spotNextToRV(rv, i), d.rv.yaw)
+            local q = byName[playerName(p)]
+            local s = q and table.remove(q, 1)
+            if valid(p.Pawn) and not seated(p.Pawn) then
+                local spot = playerSpot(rv, s, i)
+                teleportPlayer(p, spot, s and s.rel and (d.rv.yaw + (s.yaw or 0)) or d.rv.yaw)
+                R.expect[#R.expect + 1] = { pc = p, spot = spot, i = i }
+            end
+        end
+        R.stage = "check"; R.at = NOW + 3.0
+    elseif R.stage == "check" then
+        -- someone whose world hadn't streamed in yet may have dropped through the ground: try again
+        for _, e in ipairs(R.expect or {}) do
+            local p = e.pc
+            if valid(p) and valid(p.Pawn) and not seated(p.Pawn) then
+                local l = p.Pawn:K2_GetActorLocation()
+                if l.Z < e.spot.Z - 500 or dist(l, e.spot) > 3000 then
+                    log("restore: " .. playerName(p) .. " ended up away from the RV, moving again")
+                    teleportPlayer(p, spotNextToRV(rv, e.i), d.rv.yaw)
+                end
             end
         end
         S.restore = nil
         S.safe = {}
         S.health = nil
+        S.protectUntil = NOW + 6
         toast("Quick save loaded")
     end
 end
@@ -500,6 +783,14 @@ local function installHooks()
             if si then
                 local d = readSidecar(si)
                 if d and d.cp ~= si.cp then deleteSidecar(si) end
+            end
+        end) end)
+        -- the game saves at the checkpoint: keep a copy of that save in the backup rotation
+        ExecuteWithDelay(3000, function() ExecuteInGameThread(function()
+            local si = sessionInfo()
+            if si and isHost() and S.lastCpBackup ~= si.name .. "|" .. si.cp then
+                S.lastCpBackup = si.name .. "|" .. si.cp
+                pcall(makeBackup, si, "checkpoint")
             end
         end) end)
     end)
@@ -533,7 +824,22 @@ local function checkLoad()
         -- a brand new game that happens to reuse an old name
         deleteSidecar(si); return
     end
-    if data.cp == si.cp then startRestore(data) end
+    if data.cp ~= si.cp then return end
+    local forced = S.forceRestore
+    S.forceRestore = false
+    -- The level restarted (game over) within a minute of loading this quick save: loading it again
+    -- would most likely end the same way (a deadly spot, a wreck...) and loop forever.
+    -- Stay at the checkpoint this time; F9 still loads it.
+    local key = sidecarPath(si)
+    local last = S.lastRestore
+    S.lastRestore = nil
+    if not forced and last and last.key == key and NOW - last.at < 60 then
+        log(string.format("quick save not restored: the last load ended in a game over %.0f s later", NOW - last.at))
+        toast("Quick save not loaded: the last load ended in a game over.\n[" .. (CFG.keys.quick_load or "F9") .. "] = load it anyway", 7)
+        return
+    end
+    S.lastRestore = { key = key, at = NOW }
+    startRestore(data)
 end
 
 ---------------------------------------------------------------------------
@@ -541,12 +847,13 @@ end
 ---------------------------------------------------------------------------
 local function tick()
     local gm = getGM()
-    if not gm then S.gmAddr = nil; return end
+    if not gm then S.gmAddr = nil; S.lastRestore = nil; return end  -- main menu
     local addr = gm:GetAddress()
     if addr ~= S.gmAddr then S.gmAddr = addr; onLevelStart() end
 
     checkLoad()
     stepRestore()
+    updateProtection()
 
     local rv = getRV()
     if rv and not S.restore and NOW - S.lastSafeSample >= 0.5 then
@@ -583,6 +890,7 @@ local function tick()
     end
 
     if S.menu and NOW >= S.menu["until"] then S.menu = nil end
+    if S.bmenu and NOW >= S.bmenu["until"] then S.bmenu = nil end
 end
 
 LoopAsync(math.floor(TICK * 1000), function()
@@ -612,13 +920,16 @@ end
 
 bind("quick_save", "F5", function() quickSave("key") end)
 bind("quick_load", "F9", function()
-    if S.menu and NOW < S.menu["until"] then
+    if S.bmenu and NOW < S.bmenu["until"] then
+        restoreBackup()
+    elseif S.menu and NOW < S.menu["until"] then
         local sel = S.menu.sel; S.menu = nil
         goToCheckpoint(sel)
     else
         quickLoad()
     end
 end)
+bind("quick_load", "F9", backupMenu, { ModifierKey.SHIFT })
 bind("checkpoint_menu", "F8", checkpointMenu)
 bind("unstuck_player", "F6", function() unstuckPlayers(false) end)
 bind("unstuck_player", "F6", function() unstuckPlayers(true) end, { ModifierKey.SHIFT })
@@ -627,6 +938,6 @@ bind("recover_rv", "F7", recoverRV)
 -- expose for testing from other scripts
 _G.RVCP = { quickSave = quickSave, quickLoad = quickLoad, goToCheckpoint = goToCheckpoint,
     checkpointMenu = checkpointMenu, unstuckPlayers = unstuckPlayers, recoverRV = recoverRV,
-    toast = toast, state = S, version = VERSION }
+    backupMenu = backupMenu, restoreBackup = restoreBackup, toast = toast, state = S, version = VERSION }
 
 log("v" .. VERSION .. " loaded, saves in " .. SAVE_DIR)

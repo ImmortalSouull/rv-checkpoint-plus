@@ -3,7 +3,7 @@
 return {
     keys = {
         quick_save      = "F5",   -- save RV damage, items and position right now (host)
-        quick_load      = "F9",   -- go back to your last quick save (host)
+        quick_load      = "F9",   -- go back to your last quick save (host). Shift+F9 = backups menu
         checkpoint_menu = "F8",   -- pick an earlier checkpoint; F8 again = next, F9 = go (host)
         unstuck_player  = "F6",   -- put yourself next to the RV  (Shift+F6: every player)
         recover_rv      = "F7",   -- RV flipped / stuck / fell through: put it back on its wheels (host)
@@ -15,6 +15,10 @@ return {
 
     -- Quick save automatically every N minutes while driving (0 = off).
     autosave_minutes = 0,
+
+    -- Keep this many rotating backups of the game's own save (made at every quick save and checkpoint).
+    -- Shift+F9 in game lists them; F9 restores the selected one. 0 = off.
+    keep_backups = 3,
 
     -- How long on-screen messages stay, in seconds.
     message_seconds = 3.0,
